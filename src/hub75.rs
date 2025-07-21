@@ -1,0 +1,417 @@
+use esp_idf_hal::gpio::{AnyOutputPin, Output, Pin, PinDriver};
+use esp_idf_hal::sys::{GPIO_OUT_W1TC_REG, GPIO_OUT_W1TS_REG};
+use image::GenericImageView;
+
+/// This struct takes ownership of the necessary output pins
+/// but writes directly to them in batches, so they are not used
+pub struct Pins<'d> {
+    oe_pin: u8,
+    lat_pin: u8,
+    clk_pin: u8,
+    rgb_mask: u32,
+    addr_mask: u32,
+    _r1: PinDriver<'d, AnyOutputPin, Output>,
+    _g1: PinDriver<'d, AnyOutputPin, Output>,
+    _b1: PinDriver<'d, AnyOutputPin, Output>,
+    _r2: PinDriver<'d, AnyOutputPin, Output>,
+    _g2: PinDriver<'d, AnyOutputPin, Output>,
+    _b2: PinDriver<'d, AnyOutputPin, Output>,
+    _a: PinDriver<'d, AnyOutputPin, Output>,
+    _b: PinDriver<'d, AnyOutputPin, Output>,
+    _c: PinDriver<'d, AnyOutputPin, Output>,
+    _d: PinDriver<'d, AnyOutputPin, Output>,
+    _e: PinDriver<'d, AnyOutputPin, Output>,
+    _clk: PinDriver<'d, AnyOutputPin, Output>,
+    _lat: PinDriver<'d, AnyOutputPin, Output>,
+    _oe: PinDriver<'d, AnyOutputPin, Output>,
+}
+
+impl<'d> Pins<'d> {
+    /// The pins must be 0..=31 to be part of the control register 0.
+    /// * A, B, C, D must be contiguous
+    /// * R1, G1, B1 must be n, n+2, n+3 (2, 4, 5)
+    /// * R2, G2, B2 must be n, n+1, n+3 (18, 19, 21)
+    pub fn new(
+        r1: AnyOutputPin,
+        g1: AnyOutputPin,
+        b1: AnyOutputPin,
+        r2: AnyOutputPin,
+        g2: AnyOutputPin,
+        b2: AnyOutputPin,
+        a: AnyOutputPin,
+        b: AnyOutputPin,
+        c: AnyOutputPin,
+        d: AnyOutputPin,
+        e: AnyOutputPin,
+        clk: AnyOutputPin,
+        lat: AnyOutputPin,
+        oe: AnyOutputPin,
+    ) -> Pins<'d> {
+        assert_eq!(b.pin(), a.pin() + 1);
+        assert_eq!(c.pin(), b.pin() + 1);
+        assert_eq!(d.pin(), c.pin() + 1);
+
+        assert_eq!(g1.pin(), r1.pin() + 1);
+        assert_eq!(b1.pin(), g1.pin() + 1);
+
+        assert_eq!(g2.pin(), r2.pin() + 1);
+        assert_eq!(b2.pin(), g2.pin() + 1);
+
+        for p in [
+            r1.pin(),
+            g1.pin(),
+            b1.pin(),
+            r2.pin(),
+            g2.pin(),
+            b2.pin(),
+            a.pin(),
+            b.pin(),
+            c.pin(),
+            d.pin(),
+            clk.pin(),
+            lat.pin(),
+            oe.pin(),
+        ] {
+            assert!(p < 32);
+        }
+
+        let rgb1_mask: u32 = (1 << r1.pin()) | (1 << g1.pin()) | (1 << b1.pin());
+        let rgb2_mask: u32 = (1 << r2.pin()) | (1 << g2.pin()) | (1 << b2.pin());
+        let rgb_mask = rgb1_mask | rgb2_mask;
+
+        let addr_mask: u32 = (1 << a.pin()) | (1 << b.pin()) | (1 << c.pin()) | (1 << d.pin());
+
+        let _r1 = PinDriver::output(r1).unwrap();
+        let _g1 = PinDriver::output(g1).unwrap();
+        let _b1 = PinDriver::output(b1).unwrap();
+        let _r2 = PinDriver::output(r2).unwrap();
+        let _g2 = PinDriver::output(g2).unwrap();
+        let _b2 = PinDriver::output(b2).unwrap();
+        let _a = PinDriver::output(a).unwrap();
+        let _b = PinDriver::output(b).unwrap();
+        let _c = PinDriver::output(c).unwrap();
+        let _d = PinDriver::output(d).unwrap();
+        let _e = PinDriver::output(e).unwrap();
+        let _clk = PinDriver::output(clk).unwrap();
+        let _lat = PinDriver::output(lat).unwrap();
+        let _oe = PinDriver::output(oe).unwrap();
+        Pins {
+            oe_pin: _oe.pin() as u8,
+            lat_pin: _lat.pin() as u8,
+            clk_pin: _clk.pin() as u8,
+            rgb_mask,
+            addr_mask,
+            _r1,
+            _g1,
+            _b1,
+            _r2,
+            _g2,
+            _b2,
+            _a,
+            _b,
+            _c,
+            _d,
+            _e,
+            _clk,
+            _lat,
+            _oe,
+        }
+    }
+}
+pub struct Hub75<'d> {
+    pub pins: Pins<'d>,
+}
+
+/// Represents a 64x64 image in RGB111 format.
+/// The depth of the data in a Frame maps to the bit depth of the resulting image.
+///
+/// Each Frame is composed of 32 Rows of pixel data for a 64x64 display.
+/// Each Row contains 64 bytes representing pixel data.
+///
+/// For a 64x64 display, the E pin is used to select between the top and bottom half:
+/// - Rows 0-31 are addressed with E=0
+/// - Rows 32-63 are addressed with E=1
+/// Each row drives two physical rows simultaneously (row N and row N+32)
+pub type Frame = [[[u8; 64]; 32]; 3];
+
+impl<'d> Hub75<'d> {
+    /// Render a Frame using binary coded modulation (BCM) which displays the
+    /// more significant bits for a longer time
+    ///
+    /// ```
+    /// bit n     is displayed for 2^(n  ) frames
+    /// bit (n-1) is displayed for 2^(n-2) frames
+    /// ...
+    /// bit (0)   is displayed for 2^(0  ) frames
+    /// ```
+    ///
+    /// Doing this allows to represent a larger color spectrum, at the cost of lower perceived
+    /// FPS;
+    ///
+    /// Each frame is displayed for ~120us, so on a 6-bit depth image:
+    /// ```
+    /// bit 5: 3840us
+    /// bit 4: 1920us
+    /// bit 3:  960us
+    /// bit 2:  480us
+    /// bit 1:  240us
+    /// bit 0:  120us
+    ///
+    /// total frame time: 7560us (7.5ms)
+    /// ```
+    ///
+    #[link_section = ".iram1"]
+    pub fn render(&mut self, data: &Frame) {
+        let oe_pin = self.pins.oe_pin;
+        let clkpin = self.pins.clk_pin;
+        let lat_pin = self.pins.lat_pin;
+        let rgb_mask = self.pins.rgb_mask;
+        let addrmask = self.pins.addr_mask;
+
+        // enable output
+        fast_pin_down(oe_pin);
+        // questo è il numero di bit da considerare
+        let mut bit_nr = data.len() - 1;
+        for data in data.iter().rev() {
+            let tot_frames = 1 << bit_nr;
+            for _ in 0..tot_frames {
+                for (i, row) in data.iter().enumerate() {
+                    fast_pin_down(oe_pin);
+                    for element in row.iter() {
+                        let rgb1 = *element as u32 & 0b1101_0000;
+                        let rgb2 = *element as u32 & 0b0000_1011;
+                        let r1 = rgb1 & (1 << 7);
+                        let g1 = rgb1 & (1 << 6);
+                        let b1 = rgb1 & (1 << 4);
+
+                        let r2 = rgb2 & (1 << 3);
+                        let g2 = rgb2 & (1 << 1);
+                        let b2 = rgb2 & (1 << 0);
+
+                        if r1 > 0 {
+                            self.pins._r1.set_high();
+                        } else {
+                            self.pins._r1.set_low();
+                        }
+                        if g1 > 0 {
+                            self.pins._g1.set_high();
+                        } else {
+                            self.pins._g1.set_low();
+                        }
+                        if b1 > 0 {
+                            self.pins._b1.set_high();
+                        } else {
+                            self.pins._b1.set_low();
+                        }
+                        if r2 > 0 {
+                            self.pins._r2.set_high();
+                        } else {
+                            self.pins._r2.set_low();
+                        }
+                        if g2 > 0 {
+                            self.pins._g2.set_high();
+                        } else {
+                            self.pins._g2.set_low();
+                        }
+                        if b2 > 0 {
+                            self.pins._b2.set_high();
+                        } else {
+                            self.pins._b2.set_low();
+                        }
+                        self.pins._clk.set_low();
+                        self.pins._clk.set_high();
+                    }
+
+                    self.pins._oe.set_high();
+                    self.pins._lat.set_low();
+                    self.pins._lat.set_high();
+
+                    // Set address lines A, B, C, D (row selection 0-31)
+                    if i & 1 > 0 {
+                        self.pins._a.set_high();
+                    } else {
+                        self.pins._a.set_low();
+                    }
+                    if i & 2 > 0 {
+                        self.pins._b.set_high();
+                    } else {
+                        self.pins._b.set_low();
+                    }
+                    if i & 4 > 0 {
+                        self.pins._c.set_high();
+                    } else {
+                        self.pins._c.set_low();
+                    }
+                    if i & 8 > 0 {
+                        self.pins._d.set_high();
+                    } else {
+                        self.pins._d.set_low();
+                    }
+                    if i & 16 > 0 {
+                        self.pins._e.set_high();
+                    } else {
+                        self.pins._e.set_low();
+                    }
+                }
+            }
+            bit_nr -= 1;
+        }
+        // Disable the output
+        // Prevents one row from being much brighter than the others
+        fast_pin_up(oe_pin);
+    }
+
+    #[link_section = ".iram1"]
+    pub fn render_unoptimized(&mut self, image: &image::RgbImage) {
+        assert!(image.dimensions() == (64, 64));
+
+        const BIT_DEPTH: usize = 2; // Selectable bit depth (2 bits = 4 brightness levels)
+
+        // Disable output initially
+        fast_pin_up(self.pins._oe.pin() as u8);
+
+        // BCM rendering with selectable bit depth
+        // For each bit plane (MSB first for proper BCM timing)
+        for bit_plane in (0..BIT_DEPTH).rev() {
+            let frames_to_display = 1 << bit_plane; // 2^bit_plane frames
+
+            // Display this bit plane for the calculated number of frames
+            for _ in 0..frames_to_display {
+                // For each row (0-31, each drives two physical rows simultaneously)
+                for row in 0..32 {
+                    fast_pin_up(self.pins._oe.pin() as u8); // Disable output while updating data
+
+                    // For each column, clock in the pixel data
+                    for col in 0..64 {
+                        // Get pixel data for upper half (row) and lower half (row + 32)
+                        let pixel1 = image.get_pixel(col as u32, row as u32);
+                        let pixel2 = image.get_pixel(col as u32, (row + 32) as u32);
+
+                        // Extract the bit for this plane from the top bits
+                        // For 2-bit depth: use bits 7,6 (bit_plane 1->bit 7, bit_plane 0->bit 6)
+                        let bit_offset = 8 - BIT_DEPTH + bit_plane;
+
+                        // inverto blu con rosso, don't ask me why
+                        let r1 = (pixel1[2] >> bit_offset) & 1;
+                        let g1 = (pixel1[0] >> bit_offset) & 1;
+                        let b1 = (pixel1[1] >> bit_offset) & 1;
+
+                        let r2 = (pixel2[2] >> bit_offset) & 1;
+                        let g2 = (pixel2[0] >> bit_offset) & 1;
+                        let b2 = (pixel2[1] >> bit_offset) & 1;
+
+                        // Set RGB pins for both rows
+                        if r1 > 0 {
+                            fast_pin_up(self.pins._r1.pin() as u8)
+                        } else {
+                            fast_pin_down(self.pins._r1.pin() as u8)
+                        }
+                        if g1 > 0 {
+                            fast_pin_up(self.pins._g1.pin() as u8)
+                        } else {
+                            fast_pin_down(self.pins._g1.pin() as u8)
+                        }
+                        if b1 > 0 {
+                            fast_pin_up(self.pins._b1.pin() as u8)
+                        } else {
+                            fast_pin_down(self.pins._b1.pin() as u8)
+                        }
+
+                        if r2 > 0 {
+                            fast_pin_up(self.pins._r2.pin() as u8)
+                        } else {
+                            fast_pin_down(self.pins._r2.pin() as u8)
+                        }
+                        if g2 > 0 {
+                            fast_pin_up(self.pins._g2.pin() as u8)
+                        } else {
+                            fast_pin_down(self.pins._g2.pin() as u8)
+                        }
+                        if b2 > 0 {
+                            fast_pin_up(self.pins._b2.pin() as u8)
+                        } else {
+                            fast_pin_down(self.pins._b2.pin() as u8)
+                        }
+
+                        // Clock the data into the shift registers
+                        fast_pin_down(self.pins._clk.pin() as u8);
+                        fast_pin_up(self.pins._clk.pin() as u8);
+                    }
+
+                    // Latch the data from shift registers to output registers
+                    fast_pin_down(self.pins._lat.pin() as u8);
+                    fast_pin_up(self.pins._lat.pin() as u8);
+
+                    // Set address lines to select which row to display
+                    if row & 1 > 0 {
+                        fast_pin_up(self.pins._a.pin() as u8)
+                    } else {
+                        fast_pin_down(self.pins._a.pin() as u8)
+                    }
+                    if row & 2 > 0 {
+                        fast_pin_up(self.pins._b.pin() as u8)
+                    } else {
+                        fast_pin_down(self.pins._b.pin() as u8)
+                    }
+                    if row & 4 > 0 {
+                        fast_pin_up(self.pins._c.pin() as u8)
+                    } else {
+                        fast_pin_down(self.pins._c.pin() as u8)
+                    }
+                    if row & 8 > 0 {
+                        fast_pin_up(self.pins._d.pin() as u8)
+                    } else {
+                        fast_pin_down(self.pins._d.pin() as u8)
+                    }
+                    if row & 16 > 0 {
+                        fast_pin_up(self.pins._e.pin() as u8)
+                    } else {
+                        fast_pin_down(self.pins._e.pin() as u8)
+                    }
+
+                    // Enable output to display this row
+                    fast_pin_down(self.pins._oe.pin() as u8);
+
+                    // Simple delay to keep the row visible
+                    // Base delay for the shortest bit plane
+                    let mut dummy = 0u32;
+                    for _ in 0..3000 {
+                        // Reduced base delay since we have multiple frames per bit plane
+                        unsafe {
+                            core::ptr::write_volatile(&mut dummy, dummy.wrapping_add(1));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Disable output at the end
+        fast_pin_up(self.pins._oe.pin() as u8);
+    }
+}
+
+#[inline]
+fn fast_pin_set(pins: u32) {
+    unsafe {
+        core::ptr::write_volatile(GPIO_OUT_W1TS_REG as *mut _, pins);
+    }
+}
+#[inline]
+fn fast_pin_clear(pins: u32) {
+    unsafe {
+        core::ptr::write_volatile(GPIO_OUT_W1TC_REG as *mut _, pins);
+    }
+}
+
+#[inline]
+fn fast_pin_up(idx: u8) {
+    unsafe {
+        core::ptr::write_volatile(GPIO_OUT_W1TS_REG as *mut _, 1 << idx);
+    }
+}
+#[inline]
+fn fast_pin_down(idx: u8) {
+    unsafe {
+        core::ptr::write_volatile(GPIO_OUT_W1TC_REG as *mut _, 1 << idx);
+    }
+}
