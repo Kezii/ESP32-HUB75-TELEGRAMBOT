@@ -1,27 +1,30 @@
 use anyhow::Result;
 
-use base64::{prelude::BASE64_STANDARD, Engine};
-use bot_api::{telegram_post_multipart, Esp32Api};
+use bot_api::Esp32Api;
 use embedded_svc::http::client::Client;
-use esp_idf_hal::{gpio::PinDriver, io::Write, task::thread::ThreadSpawnConfiguration};
+use esp_idf_hal::task::thread::ThreadSpawnConfiguration;
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
     hal::peripherals::Peripherals,
-    http::{client::EspHttpConnection, server::EspHttpServer, Method},
+    http::{client::EspHttpConnection, Method},
 };
 use esp_idf_sys::esp_restart;
 
 use frankenstein::{
     ForwardMessageParams, GetUpdatesParams, SendChatActionParams, SendMessageParams, TelegramApi,
 };
-use image::{GenericImage, GenericImageView};
+use image::GenericImageView;
 use log::{error, info};
-use std::sync::{Mutex, RwLock};
+use std::sync::RwLock;
 
-use crate::hub75::{Frame, Hub75, Pins};
 use crate::wifi::my_wifi;
+use crate::{
+    config::get_config,
+    hub75::{Frame, Hub75},
+};
 
 mod bot_api;
+mod config;
 mod hub75;
 mod wifi;
 
@@ -72,14 +75,12 @@ fn download_file_into_buffer(url: &str, out_buffer: &mut Vec<u8>) -> Result<usiz
         return Err(anyhow::anyhow!("Status code: {}", status));
     }
 
-    let mut total_bytes_read = 0;
     let mut buffer = [0u8; 1024];
 
     while let Ok(bytes_read) = response.read(&mut buffer) {
         if bytes_read == 0 {
             break;
         }
-        total_bytes_read += bytes_read;
         out_buffer.extend_from_slice(&buffer[0..bytes_read]);
     }
 
@@ -189,8 +190,6 @@ fn main() -> Result<()> {
 
     let mut h = Hub75 { pins: _pins };
 
-    let frame_buffer_img = std::sync::Arc::new(RwLock::new(image::RgbImage::new(64, 64)));
-
     ThreadSpawnConfiguration {
         name: Some(b"fb writer\0"),
         pin_to_core: Some(esp_idf_svc::hal::cpu::Core::Core1),
@@ -199,10 +198,8 @@ fn main() -> Result<()> {
     .set()
     .unwrap();
 
-    let frame_buffer_img_clone = frame_buffer_img.clone();
     std::thread::spawn(move || loop {
         h.render(&FRAME_BUFFER.read().unwrap());
-        //h.render_unoptimized(&frame_buffer_img_clone.read().unwrap());
         std::thread::sleep(std::time::Duration::from_millis(1));
     });
     ThreadSpawnConfiguration::default().set().unwrap();
@@ -224,9 +221,10 @@ fn main() -> Result<()> {
         }
     };
 
-    let mut bot_state = BotState {
-        owner_id: FIXME,
-        bot_token: FIXME,
+    let config = get_config();
+    let bot_state = BotState {
+        owner_id: config.bot_owner_id,
+        bot_token: config.bot_token,
     };
 
     let api = Esp32Api::new(bot_state.bot_token);

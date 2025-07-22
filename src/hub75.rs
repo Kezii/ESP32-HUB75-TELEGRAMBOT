@@ -1,6 +1,5 @@
 use esp_idf_hal::gpio::{AnyOutputPin, Output, Pin, PinDriver};
 use esp_idf_hal::sys::{GPIO_OUT_W1TC_REG, GPIO_OUT_W1TS_REG};
-use image::GenericImageView;
 
 /// This struct takes ownership of the necessary output pins
 /// but writes directly to them in batches, so they are not used
