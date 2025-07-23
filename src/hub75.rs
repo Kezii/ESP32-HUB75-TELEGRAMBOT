@@ -162,12 +162,8 @@ impl<'d> Hub75<'d> {
 
         let mut gpio_states = Vec::new();
 
-        // Read current GPIO state instead of starting from 0
-        let mut current_gpio_state: u32 = 0;
+        const BIT_DEPTH: usize = 5;
 
-        const BIT_DEPTH: usize = 5; // 4 bit planes for BCM
-
-        // Get pin numbers for all pins
         let oe_pin = self.pins.oe_pin;
         let clk_pin = self.pins.clk_pin;
         let lat_pin = self.pins.lat_pin;
@@ -184,7 +180,7 @@ impl<'d> Hub75<'d> {
         let e_pin = self.pins._e.pin() as u8;
 
         // Start with a clean state - all pins LOW
-        current_gpio_state = 0;
+        let mut current_gpio_state: u32 = 0;
 
         // Set initial control pin states
         current_gpio_state |= 1 << clk_pin; // CLK HIGH
@@ -216,20 +212,16 @@ impl<'d> Hub75<'d> {
                         let pixel_upper = image.get_pixel(col as u32, row as u32);
                         let pixel_lower = image.get_pixel(col as u32, (row + 32) as u32);
 
-                        // Extract the bit for this bit plane (from MSB side for proper BCM)
                         let bit_offset = 8 - BIT_DEPTH + bit_plane;
 
-                        // Extract bits for upper half (connects to RGB1 pins)
                         let r1_bit = (lightness_correct(pixel_upper[2]) >> bit_offset) & 1;
                         let g1_bit = (lightness_correct(pixel_upper[0]) >> bit_offset) & 1;
                         let b1_bit = (lightness_correct(pixel_upper[1]) >> bit_offset) & 1;
 
-                        // Extract bits for lower half (connects to RGB2 pins)
                         let r2_bit = (lightness_correct(pixel_lower[2]) >> bit_offset) & 1;
                         let g2_bit = (lightness_correct(pixel_lower[0]) >> bit_offset) & 1;
                         let b2_bit = (lightness_correct(pixel_lower[1]) >> bit_offset) & 1;
 
-                        // Set RGB pins based on extracted bits
                         if r1_bit != 0 {
                             current_gpio_state |= 1 << r1_pin;
                         } else {
@@ -262,7 +254,7 @@ impl<'d> Hub75<'d> {
                         }
                         gpio_states.push(current_gpio_state);
 
-                        // Clock low then high - MATCH render_capture
+                        // Clock low then high
                         current_gpio_state &= !(1 << clk_pin);
                         gpio_states.push(current_gpio_state);
                         current_gpio_state |= 1 << clk_pin;
@@ -281,7 +273,6 @@ impl<'d> Hub75<'d> {
 
                     // Set row address (A, B, C, D, E pins)
                     // A, B, C, D select which of the 32 rows (0-31)
-                    // E is not used for 64x64 displays (only needed for 64x128)
                     if (row & 1) != 0 {
                         current_gpio_state |= 1 << a_pin;
                     } else {

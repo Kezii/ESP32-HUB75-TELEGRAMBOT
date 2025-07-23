@@ -8,17 +8,16 @@ use esp_idf_svc::{
     hal::peripherals::Peripherals,
     http::{client::EspHttpConnection, Method},
 };
-use esp_idf_sys::{esp_restart, GPIO_OUT_W1TC_REG, GPIO_OUT_W1TS_REG};
+use esp_idf_sys::esp_restart;
 
 use frankenstein::{
     ForwardMessageParams, GetUpdatesParams, SendChatActionParams, SendMessageParams, TelegramApi,
 };
-use image::GenericImageView;
 use log::{error, info};
 use std::sync::RwLock;
 
+use crate::wifi::my_wifi;
 use crate::{config::get_config, hub75::Hub75};
-use crate::{hub75::lightness_correct, wifi::my_wifi};
 
 mod bot_api;
 mod config;
